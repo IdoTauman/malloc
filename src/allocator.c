@@ -10,7 +10,7 @@ static BlockHeader *heap_head = NULL;
 static spinlock_t head_lock = { .lock = ATOMIC_FLAG_INIT };
 
 /**
- * requests new memory using mmap and returns a pointer to the new block, inits header.
+ * requests new memory using mmap/sbrk and returns a pointer to the new block, inits header.
  */
 static BlockHeader *request_from_os(size_t aligned_size);
 
@@ -22,11 +22,33 @@ static void split_block(BlockHeader *curr, size_t requested_size);
 
 
 static BlockHeader *request_from_os(size_t aligned_size) {
-    // TODO: Calculate page-aligned allocation size (including HEADER_SIZE)
-    // TODO: Invoke mmap()
-    // TODO: Initialize metadata and spinlock via spinlock_init()
-    // TODO: Insert into heap_head under head_lock
-    return NULL;
+    // calculate size needed (page aligned requested size + header or minimum block size)
+    size_t total_needed = aligned_size + HEADER_SIZE;
+    total_needed = total_needed > MMAP_CHUNK_SIZE ? total_needed : MMAP_CHUNK_SIZE;
+    total_needed = (total_needed + 4095) & ~4095;
+
+    // allocate pointer
+    // mmap call according to malloc standard
+    void *block_ptr = mmap(NULL, total_needed, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    // return null on fail
+    if (block_ptr == MAP_FAILED) {
+        return NULL;
+    }
+
+    // init block header
+    BlockHeader *header = (BlockHeader *)block_ptr;
+    header->is_free = 1;
+    spinlock_init(&header->lock);
+    header->next = NULL;
+    header->size = total_needed - HEADER_SIZE;
+
+    // insert into heap_head
+    spin_lock(&head_lock);
+    header->next = heap_head;
+    heap_head = header;
+    spin_unlock(&head_lock);
+
+    return header;
 }
 
 static void split_block(BlockHeader *curr, size_t requested_size) {
