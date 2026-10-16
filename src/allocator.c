@@ -22,10 +22,15 @@ static void split_block(BlockHeader *curr, size_t requested_size);
 
 
 static BlockHeader *request_from_os(size_t aligned_size) {
+    if (aligned_size == 0 ||
+        aligned_size > SIZE_MAX - HEADER_SIZE ||
+        aligned_size + HEADER_SIZE > SIZE_MAX - 4095) {
+        return NULL;
+    }
     // calculate size needed (page aligned requested size + header or minimum block size)
     size_t total_needed = aligned_size + HEADER_SIZE;
     total_needed = total_needed > MMAP_CHUNK_SIZE ? total_needed : MMAP_CHUNK_SIZE;
-    total_needed = (total_needed + 4095) & ~4095;
+    total_needed = (total_needed + 4095) & ~(size_t)4095;
 
     // allocate pointer
     // mmap call according to malloc standard
@@ -37,7 +42,7 @@ static BlockHeader *request_from_os(size_t aligned_size) {
 
     // init block header
     BlockHeader *header = (BlockHeader *)block_ptr;
-    header->is_free = 1;
+    header->is_free = false;
     spinlock_init(&header->lock);
     header->next = NULL;
     header->size = total_needed - HEADER_SIZE;
@@ -45,6 +50,9 @@ static BlockHeader *request_from_os(size_t aligned_size) {
     // insert into heap_head
     spin_lock(&head_lock);
     header->next = heap_head;
+    spin_lock(&header->lock);
+    split_block(header, aligned_size);
+    spin_unlock(&header->lock);
     heap_head = header;
     spin_unlock(&head_lock);
 
@@ -52,33 +60,84 @@ static BlockHeader *request_from_os(size_t aligned_size) {
 }
 
 static void split_block(BlockHeader *curr, size_t requested_size) {
-    // TODO: Check if remaining space >= HEADER_SIZE + ALIGNMENT
-    // TODO: Carve out new BlockHeader at the offset
-    // TODO: Initialize new header fields and splice into the linked list
-    // TODO: Update curr->size to requested_size
+    // return early if curr->size < requested_size
+    if (curr->size < requested_size) return;
+
+    // check if remaining space >= HEADER_SIZE + ALIGNMENT
+    size_t leftover = curr->size - requested_size;
+    if (leftover < HEADER_SIZE + ALIGNMENT) return;
+
+    // carve out new BlockHeader at the offset
+    uint8_t *offset = (uint8_t *)curr + sizeof(BlockHeader) + requested_size;
+    BlockHeader *new = (BlockHeader *)offset;
+
+    // initialize new header fields
+    new->is_free = true;
+    spinlock_init(&new->lock);
+    new->size = leftover - HEADER_SIZE;
+
+    // add new block to the linked list
+    new->next = curr->next;
+    curr->next = new;
+
+    curr->size = requested_size;
 }
 
 void *malloc(size_t size) {
-    if (size == 0) {
+    if (size == 0 || size > SIZE_MAX - (ALIGNMENT - 1)) {
         return NULL;
     }
 
-    // TODO:
-    // 1. Align size using ALIGN(size)
-    // 2. Traverse the list starting from heap_head using hand-over-hand locking
-    // 3. If a suitable free block is found:
-    //    - split_block(curr, aligned_size) if possible
-    //    - Mark curr->is_free = false
-    //    - Unlock curr
-    //    - Return pointer to payload (curr + 1)
-    // 4. If no suitable block is found:
-    //    - Call request_from_os(aligned_size)
-    //    - Return payload pointer
+    // align size
+    size_t aligned_size = ALIGN(size);
 
-    return NULL;
+    // traverse the list starting from heap_head using hand-over-hand locking and find a suitable block
+    BlockHeader *foundBlock = NULL;
+    BlockHeader *curr = NULL;
+    BlockHeader *next;
+
+    spin_lock(&head_lock);
+    next = heap_head;
+    if (next) {
+        spin_lock(&next->lock);
+    }
+    spin_unlock(&head_lock);
+
+    while (next) {
+        curr = next;
+        next = curr->next;
+
+        if (curr->is_free && curr->size >= aligned_size) {
+            foundBlock = curr;
+            break;
+        }
+
+        if (next) {
+            spin_lock(&next->lock);
+        }
+
+        spin_unlock(&curr->lock);
+        curr = NULL;
+    }
+
+    // if a suitable block is found, split if possible, mark it as taken, unlock, and return a pointer to the payload
+    if (foundBlock) {
+        split_block(foundBlock, aligned_size);
+        foundBlock->is_free = false;
+        spin_unlock(&foundBlock->lock);
+        return foundBlock + 1;
+    } else {
+        if (curr) {
+            spin_unlock(&curr->lock);
+        }
+        // if no suitable block is found, request a new block and return it
+        BlockHeader *newBlock = request_from_os(aligned_size);
+        if (!newBlock) return NULL;
+        return newBlock + 1;
+    }
 }
 
-void my_free(void *ptr) {
+void free(void *ptr) {
     if (!ptr) {
         return;
     }
