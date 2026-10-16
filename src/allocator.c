@@ -1,10 +1,13 @@
 #include "internal.h"
 #include <sys/mman.h>
 #include <unistd.h>
+#include <string.h>
 
 #define ALIGNMENT 16
 #define ALIGN(size) (((size) + (ALIGNMENT - 1)) & ~(ALIGNMENT - 1))
 #define HEADER_SIZE sizeof(BlockHeader)
+
+#define CALLOC_MMAP_THRESHOLD (32 * 1024)
 
 static BlockHeader *heap_head = NULL;
 static spinlock_t head_lock = { .lock = ATOMIC_FLAG_INIT };
@@ -12,7 +15,7 @@ static spinlock_t head_lock = { .lock = ATOMIC_FLAG_INIT };
 /**
  * requests new memory using mmap/sbrk and returns a pointer to the new block, inits header.
  */
-static BlockHeader *request_from_os(size_t aligned_size);
+static BlockHeader *request_from_os(size_t aligned_size, size_t actual_size);
 
 /**
  * splits an existing block into two if there is enough space for a header and the payload.
@@ -21,7 +24,7 @@ static BlockHeader *request_from_os(size_t aligned_size);
 static void split_block(BlockHeader *curr, size_t requested_size);
 
 
-static BlockHeader *request_from_os(size_t aligned_size) {
+static BlockHeader *request_from_os(size_t aligned_size, size_t actual_size) {
     if (aligned_size == 0 ||
         aligned_size > SIZE_MAX - HEADER_SIZE ||
         aligned_size + HEADER_SIZE > SIZE_MAX - 4095) {
@@ -46,6 +49,7 @@ static BlockHeader *request_from_os(size_t aligned_size) {
     spinlock_init(&header->lock);
     header->next = NULL;
     header->size = total_needed - HEADER_SIZE;
+    header->actual_size = actual_size;
 
     // insert into heap_head
     spin_lock(&head_lock);
@@ -75,6 +79,7 @@ static void split_block(BlockHeader *curr, size_t requested_size) {
     new->is_free = true;
     spinlock_init(&new->lock);
     new->size = leftover - HEADER_SIZE;
+    new->actual_size = 0;
 
     // add new block to the linked list
     new->next = curr->next;
@@ -124,6 +129,7 @@ void *malloc(size_t size) {
     if (foundBlock) {
         split_block(foundBlock, aligned_size);
         foundBlock->is_free = false;
+        foundBlock->actual_size = size;
         spin_unlock(&foundBlock->lock);
         return foundBlock + 1;
     } else {
@@ -131,7 +137,7 @@ void *malloc(size_t size) {
             spin_unlock(&curr->lock);
         }
         // if no suitable block is found, request a new block and return it
-        BlockHeader *newBlock = request_from_os(aligned_size);
+        BlockHeader *newBlock = request_from_os(aligned_size, size);
         if (!newBlock) return NULL;
         return newBlock + 1;
     }
@@ -150,23 +156,62 @@ void free(void *ptr) {
 
     // mark is_free = true
     header->is_free = true;
+    header->actual_size = 0;
 
     // release block lock
     spin_unlock(&header->lock);
 }
 
 void *calloc(size_t nmemb, size_t size) {
-    // TODO: Check for multiplication overflow
-    // TODO: Allocate memory using my_malloc(total_size)
-    // TODO: Zero out allocated memory with memset
-    return NULL;
+    // check for multiplication overflow
+    if (nmemb == 0 || size == 0 || nmemb > SIZE_MAX / size) {
+        return NULL;
+    }
+
+    size_t total_size = nmemb * size;
+    if (total_size > SIZE_MAX - (ALIGNMENT - 1)) {
+        return NULL;
+    }
+
+    // allocate zero'd memory
+    if (total_size >= CALLOC_MMAP_THRESHOLD) {
+        // use mmap directly for large allocations to avoid a wasteful memset call
+        BlockHeader *block = request_from_os(ALIGN(total_size), total_size);
+        return block ? (void *)(block + 1) : NULL;
+    } else {
+        // for small allocations, use malloc and memset
+        void *block_payload = malloc(total_size);
+        if (!block_payload) return NULL;
+        memset(block_payload, 0, total_size);
+        return block_payload;
+    }
 }
 
 void *realloc(void *ptr, size_t size) {
-    // TODO: Handle edge cases (ptr == NULL, size == 0)
-    // TODO: Allocate new block with my_malloc(size)
-    // TODO: Copy min(old_size, size) bytes to new block
-    // TODO: Free old block via my_free(ptr)
-    // TODO: Return new block pointer
-    return NULL;
+    // handle edge cases
+    if (!ptr) {
+        return malloc(size);
+    }
+
+    if (size == 0) {
+        free(ptr);
+        return NULL;
+    }
+
+    if (size > SIZE_MAX - (ALIGNMENT - 1)) return NULL;
+
+    // allocate new block
+    void *new_block = malloc(size);
+    if (!new_block) return ptr;
+
+    // copy min(old_size, size) bytes to new block
+    size_t old_size = ((BlockHeader *)((uint8_t *)ptr - HEADER_SIZE))->actual_size;
+    size_t copy_size = old_size < size ? old_size : size;
+    memcpy(new_block, ptr, copy_size);
+
+    // free old block
+    free(ptr);
+
+    // return new block pointer
+    return new_block;
 }

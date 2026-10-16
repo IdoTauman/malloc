@@ -27,9 +27,10 @@ static inline void spin_unlock(spinlock_t *sl) {
 typedef struct BlockHeader {
     struct BlockHeader *next; // 8 bytes
     size_t size; // 8 bytes
+    size_t actual_size; // 8 bytes
     spinlock_t lock; // 1 byte
     bool is_free; // 1 byte
-    uint8_t padding[14]; // padding to 32 bytes (16 byte alignment)
+    uint8_t padding[6]; // padding to 32 bytes (16 byte alignment)
 } BlockHeader;
 
 static_assert(sizeof(BlockHeader) % 16 == 0, "Header must be 16 byte aligned");
