@@ -142,11 +142,17 @@ void free(void *ptr) {
         return;
     }
 
-    // TODO:
-    // 1. Compute header address: (BlockHeader*)((uint8_t*)ptr - HEADER_SIZE)
-    // 2. Acquire block lock via spin_lock()
-    // 3. Mark is_free = true
-    // 4. Release block lock via spin_unlock()
+    // compute header address
+    BlockHeader *header = (BlockHeader *)((uint8_t *)ptr - HEADER_SIZE);
+
+    // acquire block lock
+    spin_lock(&header->lock);
+
+    // mark is_free = true
+    header->is_free = true;
+
+    // release block lock
+    spin_unlock(&header->lock);
 }
 
 void *calloc(size_t nmemb, size_t size) {
