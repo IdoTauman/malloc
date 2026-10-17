@@ -305,9 +305,9 @@ Because of the missing aligned-allocation functions and `errno` handling, it isn
 
 In rough order of payoff against effort, based on the benchmark results:
 
-1. ~~Use `mremap` in `realloc` for dedicated mappings. About 15 lines, and it should remove the copying that dominates `realloc_growth`.~~ **Done:** cut `realloc_growth` runtime from 3.091 s to 0.010 s (309x faster, 0.54 Mops/s) and halved peak RSS from 8.6 MB to 4.5 MB.
-2. Keep a few freed large mappings around instead of unmapping right away, to cut the system calls in `large_alloc`.
-3. ~~Shrink the block header to 16 bytes: pack `class_index` and `is_free` into 32-bit fields, share one field between `actual_size` and `mapping_size`, and store the free-list pointer in the payload while a block is free. This should about halve `footprint_16B` and reduce `phase_shift`.~~ **Done:** halved `footprint_16B` peak RSS from 122.1 MB (4.00x) to 61.0 MB (2.00x, matching glibc), sped up `footprint_16B` from 0.077 s to 0.049 s (82.00 Mops/s), and reduced `phase_shift` peak RSS from 396.5 MB to 333.5 MB.
+1. ~~Use `mremap` in `realloc` for dedicated mappings. About 15 lines, and it should remove the copying that dominates `realloc_growth`.~~ **Done:** cut `realloc_growth` runtime from 3.091 s to 0.010 s (309x faster, 0.53 Mops/s) and halved peak RSS from 8.6 MB to 4.5 MB.
+2. ~~Keep a few freed large mappings around instead of unmapping right away, to cut the system calls in `large_alloc`.~~ **Done:** cut `large_alloc` runtime from 0.100 s / 1.460 s / 2.344 s to 0.002 s / 0.004 s / 0.008 s at 1, 4 and 8 threads (50x to 365x faster, up to 42.23 Mops/s) with peak RSS of 1.9 to 7.1 MB (matching or beating glibc's 1.9 to 8.1 MB).
+3. ~~Shrink the block header to 16 bytes: pack `class_index` and `is_free` into 32-bit fields, share one field between `actual_size` and `mapping_size`, and store the free-list pointer in the payload while a block is free. This should about halve `footprint_16B` and reduce `phase_shift`.~~ **Done:** halved `footprint_16B` peak RSS from 122.1 MB (4.00x) to 61.0 MB (2.00x, matching glibc), sped up `footprint_16B` from 0.077 s to 0.049–0.059 s (67.57–82.00 Mops/s), and reduced `phase_shift` peak RSS from 396.5 MB to 333.5 MB.
 4. Carve chunks lazily with a bump pointer so a refill doesn't touch a whole chunk.
 5. Use finer size classes (four per power of two above 512 B) to cut internal waste.
 6. Reclaim fully free chunks with per-chunk free counts and `munmap`. This is the real fix for `phase_shift` and the most invasive change.

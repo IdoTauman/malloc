@@ -19,6 +19,9 @@
 #define CACHE_BATCH_SIZE 16
 #define CACHE_MAX_BLOCKS 32
 
+#define LARGE_CACHE_MAX 4
+#define LARGE_CACHE_MAX_BYTES (2 * 1024 * 1024)
+
 typedef struct {
     BlockHeader *free_list;
     spinlock_t lock;
@@ -31,6 +34,8 @@ typedef struct {
 
 typedef struct {
     ThreadCache classes[CLASS_COUNT];
+    BlockHeader *large_cache;
+    size_t large_count;
 } ThreadCacheState;
 
 static SizeClass size_classes[CLASS_COUNT];
@@ -51,6 +56,8 @@ static int cache_key_ready;
  */
 static spinlock_t init_lock = { .lock = ATOMIC_FLAG_INIT };
 static atomic_bool classes_initialized = ATOMIC_VAR_INIT(false);
+
+static ThreadCacheState *get_thread_cache_state(void);
 
 static void ensure_classes_initialized(void) {
     if (atomic_load_explicit(&classes_initialized, memory_order_acquire)) {
@@ -139,6 +146,30 @@ static BlockHeader *request_dedicated_mapping(size_t size) {
 
     size_t mapping_size =
         (total_size + PAGE_SIZE - 1) & ~(size_t)(PAGE_SIZE - 1);
+
+    /*
+     * Fast path: check if the current thread has a cached large mapping
+     * that is at least mapping_size (and at most 2x to avoid huge waste).
+     */
+    if (mapping_size <= LARGE_CACHE_MAX_BYTES) {
+        ThreadCacheState *state = get_thread_cache_state();
+        if (state != NULL && state->large_cache != NULL) {
+            BlockHeader **prev = &state->large_cache;
+            BlockHeader *curr = state->large_cache;
+
+            while (curr != NULL) {
+                if (curr->mapping_size >= mapping_size &&
+                    curr->mapping_size <= mapping_size * 2) {
+                    *prev = *block_next(curr);
+                    --state->large_count;
+                    curr->is_free = 0;
+                    return curr;
+                }
+                prev = block_next(curr);
+                curr = *prev;
+            }
+        }
+    }
 
     void *memory = mmap(NULL, mapping_size,
                         PROT_READ | PROT_WRITE,
@@ -232,6 +263,13 @@ static void thread_cache_destructor(void *arg) {
         class->free_list = cache->free_list;
 
         spin_unlock(&class->lock);
+    }
+
+    BlockHeader *large = state->large_cache;
+    while (large != NULL) {
+        BlockHeader *next = *block_next(large);
+        munmap(large, large->mapping_size);
+        large = next;
     }
 
     munmap(state, sizeof(*state));
@@ -432,10 +470,43 @@ static void free_impl(void *ptr) {
     BlockHeader *header = (BlockHeader *)ptr - 1;
 
     /*
-     * Dedicated mappings can be returned directly to the OS.
+     * Dedicated mappings: cache up to LARGE_CACHE_MAX blocks per thread
+     * to avoid repeated mmap/munmap and page faults, or return to the OS.
      */
     if (header->class_index == NO_CLASS) {
+        if (header->is_free) {
+            return;
+        }
+
         size_t mapping_size = header->mapping_size;
+
+        if (mapping_size <= LARGE_CACHE_MAX_BYTES) {
+            ThreadCacheState *state = get_thread_cache_state();
+            if (state != NULL) {
+                header->is_free = 1;
+                *block_next(header) = state->large_cache;
+                state->large_cache = header;
+                ++state->large_count;
+
+                /*
+                 * If the cache exceeds LARGE_CACHE_MAX, evict and unmap
+                 * the oldest block at the tail so the cache stays fresh.
+                 */
+                if (state->large_count > LARGE_CACHE_MAX) {
+                    BlockHeader **prev = &state->large_cache;
+                    BlockHeader *curr = state->large_cache;
+                    while (*block_next(curr) != NULL) {
+                        prev = block_next(curr);
+                        curr = *prev;
+                    }
+                    *prev = NULL;
+                    --state->large_count;
+                    munmap(curr, curr->mapping_size);
+                }
+                return;
+            }
+        }
+
         munmap(header, mapping_size);
         return;
     }
