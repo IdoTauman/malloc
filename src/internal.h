@@ -31,16 +31,24 @@ static inline void spin_unlock(spinlock_t *sl)
 }
 
 typedef struct BlockHeader {
-    struct BlockHeader *next;
-    size_t size;
-    size_t actual_size;
-    size_t mapping_size;
-    size_t class_index;
-    bool is_free;
-    uint8_t padding[7];
+    union {
+        size_t actual_size;
+        size_t mapping_size;
+    };
+    uint32_t class_index;
+    uint32_t is_free;
 } BlockHeader;
 
-static_assert(sizeof(BlockHeader) % 16 == 0,
-              "Header must be 16 byte aligned");
+static_assert(sizeof(BlockHeader) == 16,
+              "Header must be 16 bytes");
+
+/*
+ * Store the freelist pointer inside the unused payload while a block is free.
+ * Every size class has a capacity of at least 16 bytes (>= sizeof(void *)).
+ */
+static inline BlockHeader **block_next(BlockHeader *header)
+{
+    return (BlockHeader **)(header + 1);
+}
 
 #define MMAP_CHUNK_SIZE (64 * 1024)

@@ -14,7 +14,7 @@
 #define DIRECT_MMAP_THRESHOLD (MMAP_CHUNK_SIZE / 2)
 #define PAGE_SIZE 4096
 
-#define NO_CLASS SIZE_MAX
+#define NO_CLASS UINT32_MAX
 
 #define CACHE_BATCH_SIZE 16
 #define CACHE_MAX_BLOCKS 32
@@ -150,12 +150,9 @@ static BlockHeader *request_dedicated_mapping(size_t size) {
 
     BlockHeader *header = memory;
 
-    header->next = NULL;
-    header->size = aligned_size;
-    header->actual_size = size;
     header->mapping_size = mapping_size;
     header->class_index = NO_CLASS;
-    header->is_free = false;
+    header->is_free = 0;
 
     return header;
 }
@@ -186,12 +183,10 @@ static int refill_class(size_t index) {
     for (size_t i = 0; i < block_count; ++i) {
         BlockHeader *header = (BlockHeader *)cursor;
 
-        header->next = size_classes[index].free_list;
-        header->size = capacity;
         header->actual_size = 0;
-        header->mapping_size = 0;
-        header->class_index = index;
-        header->is_free = true;
+        header->class_index = (uint32_t)index;
+        header->is_free = 1;
+        *block_next(header) = size_classes[index].free_list;
 
         size_classes[index].free_list = header;
         cursor += stride;
@@ -229,11 +224,11 @@ static void thread_cache_destructor(void *arg) {
 
         BlockHeader *tail = cache->free_list;
 
-        while (tail->next != NULL) {
-            tail = tail->next;
+        while (*block_next(tail) != NULL) {
+            tail = *block_next(tail);
         }
 
-        tail->next = class->free_list;
+        *block_next(tail) = class->free_list;
         class->free_list = cache->free_list;
 
         spin_unlock(&class->lock);
@@ -305,9 +300,9 @@ static int refill_thread_cache(size_t index) {
 
     while (class->free_list != NULL && moved < CACHE_BATCH_SIZE) {
         BlockHeader *header = class->free_list;
-        class->free_list = header->next;
+        class->free_list = *block_next(header);
 
-        header->next = cache->free_list;
+        *block_next(header) = cache->free_list;
         cache->free_list = header;
 
         ++cache->count;
@@ -339,9 +334,9 @@ static void flush_thread_cache(size_t index) {
 
     while (cache->free_list != NULL && moved < CACHE_BATCH_SIZE) {
         BlockHeader *header = cache->free_list;
-        cache->free_list = header->next;
+        cache->free_list = *block_next(header);
 
-        header->next = batch;
+        *block_next(header) = batch;
         batch = header;
 
         --cache->count;
@@ -356,11 +351,11 @@ static void flush_thread_cache(size_t index) {
 
     BlockHeader *tail = batch;
 
-    while (tail->next != NULL) {
-        tail = tail->next;
+    while (*block_next(tail) != NULL) {
+        tail = *block_next(tail);
     }
 
-    tail->next = class->free_list;
+    *block_next(tail) = class->free_list;
     class->free_list = batch;
 
     spin_unlock(&class->lock);
@@ -400,11 +395,10 @@ static void *malloc_impl(size_t size) {
         }
 
         BlockHeader *header = class->free_list;
-        class->free_list = header->next;
+        class->free_list = *block_next(header);
 
-        header->next = NULL;
         header->actual_size = size;
-        header->is_free = false;
+        header->is_free = 0;
 
         spin_unlock(&class->lock);
 
@@ -421,12 +415,11 @@ static void *malloc_impl(size_t size) {
     }
 
     BlockHeader *header = cache->free_list;
-    cache->free_list = header->next;
+    cache->free_list = *block_next(header);
     --cache->count;
 
-    header->next = NULL;
     header->actual_size = size;
-    header->is_free = false;
+    header->is_free = 0;
 
     return (void *)(header + 1);
 }
@@ -460,7 +453,7 @@ static void free_impl(void *ptr) {
     ensure_classes_initialized();
 
     header->actual_size = 0;
-    header->is_free = true;
+    header->is_free = 1;
 
     ThreadCacheState *state = get_thread_cache_state();
 
@@ -473,7 +466,7 @@ static void free_impl(void *ptr) {
 
         spin_lock(&class->lock);
 
-        header->next = class->free_list;
+        *block_next(header) = class->free_list;
         class->free_list = header;
 
         spin_unlock(&class->lock);
@@ -485,7 +478,7 @@ static void free_impl(void *ptr) {
     /*
      * Fast path: return the block to the freeing thread's local cache.
      */
-    header->next = cache->free_list;
+    *block_next(header) = cache->free_list;
     cache->free_list = header;
     ++cache->count;
 
@@ -527,49 +520,67 @@ static void *realloc_impl(void *ptr, size_t size) {
     }
 
     BlockHeader *old_header = (BlockHeader *)ptr - 1;
+
+    if (old_header->class_index == NO_CLASS) {
+        size_t old_capacity = old_header->mapping_size - HEADER_SIZE;
+
+        if (old_capacity >= size) {
+            return ptr;
+        }
+
+#ifdef __linux__
+        size_t aligned_size = ALIGN(size);
+
+        if (aligned_size > SIZE_MAX - HEADER_SIZE) {
+            return NULL;
+        }
+
+        size_t total_size = HEADER_SIZE + aligned_size;
+
+        if (total_size > SIZE_MAX - (PAGE_SIZE - 1)) {
+            return NULL;
+        }
+
+        size_t new_mapping_size =
+            (total_size + PAGE_SIZE - 1) & ~(size_t)(PAGE_SIZE - 1);
+
+        void *memory = mremap(old_header, old_header->mapping_size,
+                              new_mapping_size, MREMAP_MAYMOVE);
+
+        if (memory == MAP_FAILED) {
+            return NULL;
+        }
+
+        BlockHeader *new_header = memory;
+        new_header->mapping_size = new_mapping_size;
+
+        return (void *)(new_header + 1);
+#else
+        void *new_ptr = malloc_impl(size);
+
+        if (new_ptr == NULL) {
+            return NULL;
+        }
+
+        size_t copy_size = old_capacity < size ? old_capacity : size;
+        memcpy(new_ptr, ptr, copy_size);
+
+        free_impl(ptr);
+
+        return new_ptr;
+#endif
+    }
+
     size_t old_size = old_header->actual_size;
+    size_t old_capacity = class_capacity(old_header->class_index);
 
     /*
      * Keep the allocation if its existing capacity is sufficient.
      */
-    if (old_header->size >= size) {
+    if (old_capacity >= size) {
         old_header->actual_size = size;
         return ptr;
     }
-
-    #ifdef __linux__
-        /*
-         * If the block is a dedicated mmap, resize it via mremap
-         */
-        if (old_header->class_index == NO_CLASS) {
-            size_t aligned_size = ALIGN(size);
-
-            if (aligned_size > SIZE_MAX - HEADER_SIZE) {
-                return NULL;
-            }
-
-            size_t total_size = HEADER_SIZE + aligned_size;
-
-            if (total_size > SIZE_MAX - (PAGE_SIZE - 1)) {
-                return NULL;
-            }
-
-            size_t new_map_size = (total_size + PAGE_SIZE - 1) & ~(size_t)(PAGE_SIZE - 1);
-
-            void *memory = mremap(old_header, old_header->mapping_size, new_map_size, MREMAP_MAYMOVE);
-
-            if (memory == MAP_FAILED) {
-                return NULL;
-            }
-
-            BlockHeader *new_header = (BlockHeader *)memory;
-            new_header->size = new_map_size - HEADER_SIZE;
-            new_header->actual_size = size;
-            new_header->mapping_size = new_map_size;
-
-            return (void *)(new_header + 1);
-        }
-    #endif
 
     void *new_ptr = malloc_impl(size);
 
