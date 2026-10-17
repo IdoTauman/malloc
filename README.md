@@ -20,6 +20,7 @@ This README covers the implementation, how I got there, the benchmark setup and 
 8. [Correctness testing](#correctness-testing)
 9. [Limitations](#limitations)
 10. [Roadmap](#roadmap)
+11. [AI assistance](#ai-assistance)
 
 ## Performance at a glance
 
@@ -314,6 +315,17 @@ In rough order of payoff against effort, based on the benchmark results:
 8. Profile the 8-thread run with `perf` and try wider thread-cache batches.
 
 After items 1 to 3 I'll rerun Benchmark 2 and add the new numbers next to the current ones.
+
+## AI assistance
+
+I used AI assistants while working on this project, in these areas:
+
+- **Refactoring.** Restructuring the code, for example splitting the public entry points from the static `*_impl` functions.
+- **Troubleshooting and debugging.** Diagnosing problems such as the `calloc` self-recursion caused by GCC's optimization, and getting the sanitizer builds to work.
+- **Tests and benchmarks.** Writing and extending the test programs (including the cross-thread test) and the benchmarks, including the adversarial one.
+- **This README.** Drafting and editing it, including the analysis sections. (I came up with most of the results myself and used the AI to help compile and write them up.)
+
+The benchmark numbers come from runs on my own machine. I ran the tests and sanitizers myself, and I am responsible for what is in this repository. The explanations in the analysis are hypotheses where I say they are, and some of them are still unverified.
 
 ## License
 
