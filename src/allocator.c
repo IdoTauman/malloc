@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include "internal.h"
 
 #include <pthread.h>
@@ -535,6 +536,40 @@ static void *realloc_impl(void *ptr, size_t size) {
         old_header->actual_size = size;
         return ptr;
     }
+
+    #ifdef __linux__
+        /*
+         * If the block is a dedicated mmap, resize it via mremap
+         */
+        if (old_header->class_index == NO_CLASS) {
+            size_t aligned_size = ALIGN(size);
+
+            if (aligned_size > SIZE_MAX - HEADER_SIZE) {
+                return NULL;
+            }
+
+            size_t total_size = HEADER_SIZE + aligned_size;
+
+            if (total_size > SIZE_MAX - (PAGE_SIZE - 1)) {
+                return NULL;
+            }
+
+            size_t new_map_size = (total_size + PAGE_SIZE - 1) & ~(size_t)(PAGE_SIZE - 1);
+
+            void *memory = mremap(old_header, old_header->mapping_size, new_map_size, MREMAP_MAYMOVE);
+
+            if (memory == MAP_FAILED) {
+                return NULL;
+            }
+
+            BlockHeader *new_header = (BlockHeader *)memory;
+            new_header->size = new_map_size - HEADER_SIZE;
+            new_header->actual_size = size;
+            new_header->mapping_size = new_map_size;
+
+            return (void *)(new_header + 1);
+        }
+    #endif
 
     void *new_ptr = malloc_impl(size);
 
