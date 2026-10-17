@@ -289,7 +289,7 @@ The sanitizer builds compile the allocator source into each test with the `-D` r
 Known gaps as of now:
 
 - No coalescing and no reuse across size classes. Memory in a class stays with that class for the life of the process.
-- Large per-block overhead (a header of about 48 bytes, inferred from the measurements).
+- Large per-block overhead.
 - Power-of-two classes above 512 B waste up to about 2x.
 - Large allocations and `realloc` growth make at least one `mmap`/`munmap` pair per operation, and `realloc` always copies.
 - A refill writes a header into every block of a whole chunk, so it touches all of that chunk's pages up front.
