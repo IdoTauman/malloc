@@ -88,7 +88,7 @@ static void split_block(BlockHeader *curr, size_t requested_size) {
     curr->size = requested_size;
 }
 
-void *malloc(size_t size) {
+static void *malloc_impl(size_t size) {
     if (size == 0 || size > SIZE_MAX - (ALIGNMENT - 1)) {
         return NULL;
     }
@@ -143,7 +143,7 @@ void *malloc(size_t size) {
     }
 }
 
-void free(void *ptr) {
+static void free_impl(void *ptr) {
     if (!ptr) {
         return;
     }
@@ -162,7 +162,7 @@ void free(void *ptr) {
     spin_unlock(&header->lock);
 }
 
-void *calloc(size_t nmemb, size_t size) {
+static void *calloc_impl(size_t nmemb, size_t size) {
     // check for multiplication overflow
     if (nmemb == 0 || size == 0 || nmemb > SIZE_MAX / size) {
         return NULL;
@@ -179,29 +179,28 @@ void *calloc(size_t nmemb, size_t size) {
         BlockHeader *block = request_from_os(ALIGN(total_size), total_size);
         return block ? (void *)(block + 1) : NULL;
     } else {
-        // for small allocations, use malloc and memset
-        void *block_payload = malloc(total_size);
+        void *block_payload = malloc_impl(total_size);
         if (!block_payload) return NULL;
         memset(block_payload, 0, total_size);
         return block_payload;
     }
 }
 
-void *realloc(void *ptr, size_t size) {
+static void *realloc_impl(void *ptr, size_t size) {
     // handle edge cases
     if (!ptr) {
-        return malloc(size);
+        return malloc_impl(size);
     }
 
     if (size == 0) {
-        free(ptr);
+        free_impl(ptr);
         return NULL;
     }
 
     if (size > SIZE_MAX - (ALIGNMENT - 1)) return NULL;
 
     // allocate new block
-    void *new_block = malloc(size);
+    void *new_block = malloc_impl(size);
     if (!new_block) return ptr;
 
     // copy min(old_size, size) bytes to new block
@@ -210,8 +209,13 @@ void *realloc(void *ptr, size_t size) {
     memcpy(new_block, ptr, copy_size);
 
     // free old block
-    free(ptr);
+    free_impl(ptr);
 
     // return new block pointer
     return new_block;
 }
+
+void *malloc(size_t size) { return malloc_impl(size); }
+void *calloc(size_t nmemb, size_t size) { return calloc_impl(nmemb, size); }
+void *realloc(void *ptr, size_t size) { return realloc_impl(ptr, size); }
+void free(void *ptr) { free_impl(ptr); }

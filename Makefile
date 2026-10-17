@@ -1,6 +1,6 @@
 CC       := gcc
-CFLAGS   := -std=c11 -Wall -Wextra -Werror -O2 -pthread
-CPPFLAGS := -Iinclude
+CFLAGS   := -std=c11 -Wall -Wextra -Werror -O2 -g -pthread -fno-builtin-malloc
+CPPFLAGS := -D_DEFAULT_SOURCE -Iinclude
 LDFLAGS  := -pthread
 
 BUILD_DIR := build

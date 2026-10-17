@@ -9,85 +9,122 @@
 
 #define ALIGNMENT 16
 
+#define CHECK_START(name) do { \
+    printf("[START] %s\n", name); \
+    fflush(stdout); \
+} while (0)
+
+#define CHECK_DONE(name) do { \
+    printf("[ OK  ] %s\n", name); \
+    fflush(stdout); \
+} while (0)
+
 int main(void) {
-    // malloc: basic allocation, alignment, read/write
-    char *p = malloc(32);
+    char *p;
+    unsigned char *c;
+    char *r;
+    char *grown;
+    char *shrunk;
+    volatile size_t huge_count = SIZE_MAX;
+
+    CHECK_START("malloc basic allocation");
+    p = malloc(32);
     assert(p != NULL);
     assert((uintptr_t)p % ALIGNMENT == 0);
+    CHECK_DONE("malloc basic allocation");
 
+    CHECK_START("write and read allocated memory");
     for (size_t i = 0; i < 32; i++) {
         p[i] = (char)i;
     }
-
     for (size_t i = 0; i < 32; i++) {
         assert(p[i] == (char)i);
     }
+    CHECK_DONE("write and read allocated memory");
 
+    CHECK_START("free basic allocation");
     free(p);
+    CHECK_DONE("free basic allocation");
 
-    // malloc: zero-size allocation (this implementation returns NULL)
+    CHECK_START("malloc zero");
     assert(malloc(0) == NULL);
+    CHECK_DONE("malloc zero");
 
-    // calloc: memory must be zero-initialized
-    unsigned char *c = calloc(64, sizeof(*c));
+    CHECK_START("calloc zero initialization");
+    c = calloc(64, sizeof(*c));
     assert(c != NULL);
-
     for (size_t i = 0; i < 64; i++) {
         assert(c[i] == 0);
     }
+    CHECK_DONE("calloc zero initialization");
 
+    CHECK_START("free calloc allocation");
     free(c);
+    CHECK_DONE("free calloc allocation");
 
-    // calloc: multiplication overflow
-    assert(calloc(SIZE_MAX, 2) == NULL);
+    CHECK_START("calloc multiplication overflow");
+    assert(calloc(huge_count, 2) == NULL);
+    CHECK_DONE("calloc multiplication overflow");
+
+    CHECK_START("calloc zero count");
     assert(calloc(0, 10) == NULL);
+    CHECK_DONE("calloc zero count");
+
+    CHECK_START("calloc zero element size");
     assert(calloc(10, 0) == NULL);
+    CHECK_DONE("calloc zero element size");
 
-    // realloc: grow while preserving the original contents
-    char *r = malloc(16);
+    CHECK_START("realloc grow");
+    r = malloc(16);
     assert(r != NULL);
-
     for (size_t i = 0; i < 16; i++) {
         r[i] = (char)(i + 1);
     }
 
-    char *grown = realloc(r, 64);
+    grown = realloc(r, 64);
     assert(grown != NULL);
-
     for (size_t i = 0; i < 16; i++) {
         assert(grown[i] == (char)(i + 1));
     }
-
-    // The newly added portion is writable
     for (size_t i = 16; i < 64; i++) {
         grown[i] = (char)i;
     }
+    CHECK_DONE("realloc grow");
 
+    CHECK_START("free grown allocation");
     free(grown);
+    CHECK_DONE("free grown allocation");
 
-    // realloc: shrink while preserving the retained contents
+    CHECK_START("realloc shrink");
     r = malloc(32);
     assert(r != NULL);
     memset(r, 0x5A, 32);
 
-    char *shrunk = realloc(r, 8);
+    shrunk = realloc(r, 8);
     assert(shrunk != NULL);
-
     for (size_t i = 0; i < 8; i++) {
         assert(shrunk[i] == 0x5A);
     }
+    CHECK_DONE("realloc shrink");
 
+    CHECK_START("free shrunk allocation");
     free(shrunk);
+    CHECK_DONE("free shrunk allocation");
 
-    // realloc: NULL pointer behaves like malloc
+    CHECK_START("realloc NULL pointer");
     r = realloc(NULL, 24);
     assert(r != NULL);
-    free(r);
+    CHECK_DONE("realloc NULL pointer");
 
-    // realloc: size zero frees the allocation and returns NULL
+    CHECK_START("free realloc NULL result");
+    free(r);
+    CHECK_DONE("free realloc NULL result");
+
+    CHECK_START("realloc size zero");
     r = malloc(16);
     assert(r != NULL);
     assert(realloc(r, 0) == NULL);
+    CHECK_DONE("realloc size zero");
 
     puts("test_basic: all tests passed");
     return 0;
