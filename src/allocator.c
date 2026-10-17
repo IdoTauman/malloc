@@ -1,91 +1,178 @@
 #include "internal.h"
+
 #include <sys/mman.h>
-#include <unistd.h>
 #include <string.h>
 
 #define ALIGNMENT 16
-#define ALIGN(size) (((size) + (ALIGNMENT - 1)) & ~(ALIGNMENT - 1))
+#define ALIGN(size) (((size) + (ALIGNMENT - 1)) & ~(size_t)(ALIGNMENT - 1))
 #define HEADER_SIZE sizeof(BlockHeader)
 
-#define CALLOC_MMAP_THRESHOLD (32 * 1024)
+#define SMALL_CLASS_COUNT 32
+#define CLASS_COUNT (SMALL_CLASS_COUNT + sizeof(size_t) * 8 - 10)
+#define DIRECT_MMAP_THRESHOLD (MMAP_CHUNK_SIZE / 2)
+#define PAGE_SIZE 4096
 
-static BlockHeader *heap_head = NULL;
-static spinlock_t head_lock = { .lock = ATOMIC_FLAG_INIT };
+#define NO_CLASS SIZE_MAX
 
-/**
- * requests new memory using mmap/sbrk and returns a pointer to the new block, inits header.
+typedef struct {
+    BlockHeader *free_list;
+    spinlock_t lock;
+} SizeClass;
+
+static SizeClass size_classes[CLASS_COUNT];
+
+/*
+ * initialize class locks exactly once
  */
-static BlockHeader *request_from_os(size_t aligned_size, size_t actual_size);
+static spinlock_t init_lock = { .lock = ATOMIC_FLAG_INIT };
+static atomic_bool classes_initialized = ATOMIC_VAR_INIT(false);
 
-/**
- * splits an existing block into two if there is enough space for a header and the payload.
- * assumes the block curr is already locked by the caller.
- */
-static void split_block(BlockHeader *curr, size_t requested_size);
-
-
-static BlockHeader *request_from_os(size_t aligned_size, size_t actual_size) {
-    if (aligned_size == 0 ||
-        aligned_size > SIZE_MAX - HEADER_SIZE ||
-        aligned_size + HEADER_SIZE > SIZE_MAX - 4095) {
-        return NULL;
-    }
-    // calculate size needed (page aligned requested size + header or minimum block size)
-    size_t total_needed = aligned_size + HEADER_SIZE;
-    total_needed = total_needed > MMAP_CHUNK_SIZE ? total_needed : MMAP_CHUNK_SIZE;
-    total_needed = (total_needed + 4095) & ~(size_t)4095;
-
-    // allocate pointer
-    // mmap call according to malloc standard
-    void *block_ptr = mmap(NULL, total_needed, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    // return null on fail
-    if (block_ptr == MAP_FAILED) {
-        return NULL;
+static void ensure_classes_initialized(void) {
+    if (atomic_load_explicit(&classes_initialized, memory_order_acquire)) {
+        return;
     }
 
-    // init block header
-    BlockHeader *header = (BlockHeader *)block_ptr;
-    header->is_free = false;
-    spinlock_init(&header->lock);
+    spin_lock(&init_lock);
+
+    if (!atomic_load_explicit(&classes_initialized, memory_order_relaxed)) {
+        for (size_t i = 0; i < CLASS_COUNT; ++i) {
+            size_classes[i].free_list = NULL;
+            spinlock_init(&size_classes[i].lock);
+        }
+
+        atomic_store_explicit(
+            &classes_initialized, true, memory_order_release);
+    }
+
+    spin_unlock(&init_lock);
+}
+
+/*
+ * classes:
+ *   16, 32, 48, ..., 512 bytes
+ *   1024, 2048, 4096, ... bytes
+ */
+static size_t class_capacity(size_t index) {
+    if (index < SMALL_CLASS_COUNT) {
+        return (index + 1) * ALIGNMENT;
+    }
+
+    return (size_t)1 << (index - SMALL_CLASS_COUNT + 10);
+}
+
+/*
+ * returns NO_CLASS if the requested size cannot be represented by a class
+ */
+static size_t size_to_class(size_t size) {
+    if (size == 0) {
+        return NO_CLASS;
+    }
+
+    if (size <= 512) {
+        return (size - 1) / ALIGNMENT;
+    }
+
+    size_t index = SMALL_CLASS_COUNT;
+    size_t capacity = 1024;
+
+    while (capacity < size) {
+        if (capacity > SIZE_MAX / 2) {
+            return NO_CLASS;
+        }
+
+        capacity *= 2;
+        ++index;
+    }
+
+    if (index >= CLASS_COUNT) {
+        return NO_CLASS;
+    }
+
+    return index;
+}
+
+/*
+ * map a dedicated allocation, large requests do not enter a size class
+ * freelist, so freeing them can release their mapping immediately
+ */
+static BlockHeader *request_dedicated_mapping(size_t size) {
+    if (size > SIZE_MAX - (ALIGNMENT - 1)) {
+        return NULL;
+    }
+
+    size_t aligned_size = ALIGN(size);
+
+    if (aligned_size > SIZE_MAX - HEADER_SIZE) {
+        return NULL;
+    }
+
+    size_t total_size = HEADER_SIZE + aligned_size;
+
+    if (total_size > SIZE_MAX - (PAGE_SIZE - 1)) {
+        return NULL;
+    }
+
+    size_t mapping_size =
+        (total_size + PAGE_SIZE - 1) & ~(size_t)(PAGE_SIZE - 1);
+
+    void *memory = mmap(NULL, mapping_size,
+                        PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+    if (memory == MAP_FAILED) {
+        return NULL;
+    }
+
+    BlockHeader *header = memory;
+
     header->next = NULL;
-    header->size = total_needed - HEADER_SIZE;
-    header->actual_size = actual_size;
-
-    // insert into heap_head
-    spin_lock(&head_lock);
-    header->next = heap_head;
-    spin_lock(&header->lock);
-    split_block(header, aligned_size);
-    spin_unlock(&header->lock);
-    heap_head = header;
-    spin_unlock(&head_lock);
+    header->size = aligned_size;
+    header->actual_size = size;
+    header->mapping_size = mapping_size;
+    header->class_index = NO_CLASS;
+    header->is_free = false;
 
     return header;
 }
 
-static void split_block(BlockHeader *curr, size_t requested_size) {
-    // return early if curr->size < requested_size
-    if (curr->size < requested_size) return;
+/*
+ * add blocks from a new mmap chunk to one class's freelist
+ * the caller must hold that class's lock
+ */
+static int refill_class(size_t index) {
+    size_t capacity = class_capacity(index);
+    size_t stride = HEADER_SIZE + capacity;
 
-    // check if remaining space >= HEADER_SIZE + ALIGNMENT
-    size_t leftover = curr->size - requested_size;
-    if (leftover < HEADER_SIZE + ALIGNMENT) return;
+    if (stride > MMAP_CHUNK_SIZE) {
+        return 0;
+    }
 
-    // carve out new BlockHeader at the offset
-    uint8_t *offset = (uint8_t *)curr + sizeof(BlockHeader) + requested_size;
-    BlockHeader *new = (BlockHeader *)offset;
+    void *memory = mmap(NULL, MMAP_CHUNK_SIZE,
+                        PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 
-    // initialize new header fields
-    new->is_free = true;
-    spinlock_init(&new->lock);
-    new->size = leftover - HEADER_SIZE;
-    new->actual_size = 0;
+    if (memory == MAP_FAILED) {
+        return 0;
+    }
 
-    // add new block to the linked list
-    new->next = curr->next;
-    curr->next = new;
+    size_t block_count = MMAP_CHUNK_SIZE / stride;
+    uint8_t *cursor = memory;
 
-    curr->size = requested_size;
+    for (size_t i = 0; i < block_count; ++i) {
+        BlockHeader *header = (BlockHeader *)cursor;
+
+        header->next = size_classes[index].free_list;
+        header->size = capacity;
+        header->actual_size = 0;
+        header->mapping_size = 0;
+        header->class_index = index;
+        header->is_free = true;
+
+        size_classes[index].free_list = header;
+        cursor += stride;
+    }
+
+    return 1;
 }
 
 static void *malloc_impl(size_t size) {
@@ -93,102 +180,95 @@ static void *malloc_impl(size_t size) {
         return NULL;
     }
 
-    // align size
-    size_t aligned_size = ALIGN(size);
+    ensure_classes_initialized();
 
-    // traverse the list starting from heap_head using hand-over-hand locking and find a suitable block
-    BlockHeader *foundBlock = NULL;
-    BlockHeader *curr = NULL;
-    BlockHeader *next;
+    size_t index = size_to_class(size);
 
-    spin_lock(&head_lock);
-    next = heap_head;
-    if (next) {
-        spin_lock(&next->lock);
-    }
-    spin_unlock(&head_lock);
-
-    while (next) {
-        curr = next;
-        next = curr->next;
-
-        if (curr->is_free && curr->size >= aligned_size) {
-            foundBlock = curr;
-            break;
-        }
-
-        if (next) {
-            spin_lock(&next->lock);
-        }
-
-        spin_unlock(&curr->lock);
-        curr = NULL;
+    /*
+     * large blocks bypass the class freelists
+     */
+    if (index == NO_CLASS ||
+        class_capacity(index) >= DIRECT_MMAP_THRESHOLD) {
+        BlockHeader *header = request_dedicated_mapping(size);
+        return header ? (void *)(header + 1) : NULL;
     }
 
-    // if a suitable block is found, split if possible, mark it as taken, unlock, and return a pointer to the payload
-    if (foundBlock) {
-        split_block(foundBlock, aligned_size);
-        foundBlock->is_free = false;
-        foundBlock->actual_size = size;
-        spin_unlock(&foundBlock->lock);
-        return foundBlock + 1;
-    } else {
-        if (curr) {
-            spin_unlock(&curr->lock);
-        }
-        // if no suitable block is found, request a new block and return it
-        BlockHeader *newBlock = request_from_os(aligned_size, size);
-        if (!newBlock) return NULL;
-        return newBlock + 1;
+    SizeClass *class = &size_classes[index];
+
+    spin_lock(&class->lock);
+
+    if (class->free_list == NULL && !refill_class(index)) {
+        spin_unlock(&class->lock);
+        return NULL;
     }
+
+    BlockHeader *header = class->free_list;
+    class->free_list = header->next;
+
+    header->next = NULL;
+    header->actual_size = size;
+    header->is_free = false;
+
+    spin_unlock(&class->lock);
+
+    return (void *)(header + 1);
 }
 
 static void free_impl(void *ptr) {
-    if (!ptr) {
+    if (ptr == NULL) {
         return;
     }
 
-    // compute header address
-    BlockHeader *header = (BlockHeader *)((uint8_t *)ptr - HEADER_SIZE);
+    BlockHeader *header = (BlockHeader *)ptr - 1;
 
-    // acquire block lock
-    spin_lock(&header->lock);
+    /*
+     * dedicated mappings can be returned directly to the os
+     */
+    if (header->class_index == NO_CLASS) {
+        size_t mapping_size = header->mapping_size;
+        munmap(header, mapping_size);
+        return;
+    }
 
-    // mark is_free = true
-    header->is_free = true;
+    size_t index = header->class_index;
+    SizeClass *class = &size_classes[index];
+
+    spin_lock(&class->lock);
+
+    /*
+     * avoid inserting the same block twice if a block is accidentally
+     * freed twice. passing an invalid pointer to free remains undefined
+     */
+    if (header->is_free) {
+        spin_unlock(&class->lock);
+        return;
+    }
+
     header->actual_size = 0;
+    header->is_free = true;
+    header->next = class->free_list;
+    class->free_list = header;
 
-    // release block lock
-    spin_unlock(&header->lock);
+    spin_unlock(&class->lock);
 }
 
 static void *calloc_impl(size_t nmemb, size_t size) {
-    // check for multiplication overflow
     if (nmemb == 0 || size == 0 || nmemb > SIZE_MAX / size) {
         return NULL;
     }
 
     size_t total_size = nmemb * size;
-    if (total_size > SIZE_MAX - (ALIGNMENT - 1)) {
-        return NULL;
+    void *ptr = malloc_impl(total_size);
+
+    if (ptr != NULL) {
+        memset(ptr, 0, total_size);
     }
 
-    // allocate zero'd memory
-    if (total_size >= CALLOC_MMAP_THRESHOLD) {
-        // use mmap directly for large allocations to avoid a wasteful memset call
-        BlockHeader *block = request_from_os(ALIGN(total_size), total_size);
-        return block ? (void *)(block + 1) : NULL;
-    } else {
-        void *block_payload = malloc_impl(total_size);
-        if (!block_payload) return NULL;
-        memset(block_payload, 0, total_size);
-        return block_payload;
-    }
+    return ptr;
 }
 
 static void *realloc_impl(void *ptr, size_t size) {
-    // handle edge cases
-    if (!ptr) {
+    if (ptr == NULL) {
         return malloc_impl(size);
     }
 
@@ -197,25 +277,48 @@ static void *realloc_impl(void *ptr, size_t size) {
         return NULL;
     }
 
-    if (size > SIZE_MAX - (ALIGNMENT - 1)) return NULL;
+    if (size > SIZE_MAX - (ALIGNMENT - 1)) {
+        return NULL;
+    }
 
-    // allocate new block
-    void *new_block = malloc_impl(size);
-    if (!new_block) return ptr;
+    BlockHeader *old_header = (BlockHeader *)ptr - 1;
+    size_t old_size = old_header->actual_size;
 
-    // copy min(old_size, size) bytes to new block
-    size_t old_size = ((BlockHeader *)((uint8_t *)ptr - HEADER_SIZE))->actual_size;
+    /*
+     * keep the allocation if its existing capacity is sufficient
+     * update the requested size for future realloc calls.
+     */
+    if (old_header->size >= size) {
+        old_header->actual_size = size;
+        return ptr;
+    }
+
+    void *new_ptr = malloc_impl(size);
+
+    if (new_ptr == NULL) {
+        return NULL;
+    }
+
     size_t copy_size = old_size < size ? old_size : size;
-    memcpy(new_block, ptr, copy_size);
+    memcpy(new_ptr, ptr, copy_size);
 
-    // free old block
     free_impl(ptr);
 
-    // return new block pointer
-    return new_block;
+    return new_ptr;
 }
 
-void *malloc(size_t size) { return malloc_impl(size); }
-void *calloc(size_t nmemb, size_t size) { return calloc_impl(nmemb, size); }
-void *realloc(void *ptr, size_t size) { return realloc_impl(ptr, size); }
-void free(void *ptr) { free_impl(ptr); }
+void *malloc(size_t size) {
+    return malloc_impl(size);
+}
+
+void *calloc(size_t nmemb, size_t size) {
+    return calloc_impl(nmemb, size);
+}
+
+void *realloc(void *ptr, size_t size) {
+    return realloc_impl(ptr, size);
+}
+
+void free(void *ptr) {
+    free_impl(ptr);
+}
