@@ -1,5 +1,6 @@
 #include "internal.h"
 
+#include <pthread.h>
 #include <sys/mman.h>
 #include <string.h>
 
@@ -14,15 +15,38 @@
 
 #define NO_CLASS SIZE_MAX
 
+#define CACHE_BATCH_SIZE 16
+#define CACHE_MAX_BLOCKS 32
+
 typedef struct {
     BlockHeader *free_list;
     spinlock_t lock;
-} __attribute__((aligned(64))) SizeClass;
+} SizeClass;
+
+typedef struct {
+    BlockHeader *free_list;
+    size_t count;
+} ThreadCache;
+
+typedef struct {
+    ThreadCache classes[CLASS_COUNT];
+} ThreadCacheState;
 
 static SizeClass size_classes[CLASS_COUNT];
 
 /*
- * initialize class locks exactly once
+ * Thread-local pointer to the current thread's cache state.
+ * The state itself is mmap-allocated so its lifetime can be managed
+ * by the pthread-specific-data destructor.
+ */
+static _Thread_local ThreadCacheState *thread_cache_state;
+
+static pthread_key_t cache_key;
+static pthread_once_t cache_key_once = PTHREAD_ONCE_INIT;
+static int cache_key_ready;
+
+/*
+ * Initialize class locks exactly once.
  */
 static spinlock_t init_lock = { .lock = ATOMIC_FLAG_INIT };
 static atomic_bool classes_initialized = ATOMIC_VAR_INIT(false);
@@ -48,7 +72,7 @@ static void ensure_classes_initialized(void) {
 }
 
 /*
- * classes:
+ * Classes:
  *   16, 32, 48, ..., 512 bytes
  *   1024, 2048, 4096, ... bytes
  */
@@ -61,7 +85,7 @@ static size_t class_capacity(size_t index) {
 }
 
 /*
- * returns NO_CLASS if the requested size cannot be represented by a class
+ * Return NO_CLASS if the requested size cannot be represented by a class.
  */
 static size_t size_to_class(size_t size) {
     if (size == 0) {
@@ -92,8 +116,8 @@ static size_t size_to_class(size_t size) {
 }
 
 /*
- * map a dedicated allocation, large requests do not enter a size class
- * freelist, so freeing them can release their mapping immediately
+ * Map a dedicated allocation. Large requests bypass size-class freelists
+ * so that freeing them can release their mapping immediately.
  */
 static BlockHeader *request_dedicated_mapping(size_t size) {
     if (size > SIZE_MAX - (ALIGNMENT - 1)) {
@@ -136,8 +160,8 @@ static BlockHeader *request_dedicated_mapping(size_t size) {
 }
 
 /*
- * add blocks from a new mmap chunk to one class's freelist
- * the caller must hold that class's lock
+ * Add blocks from a new mmap chunk to one class's shared freelist.
+ * The caller must hold that class's lock.
  */
 static int refill_class(size_t index) {
     size_t capacity = class_capacity(index);
@@ -175,6 +199,172 @@ static int refill_class(size_t index) {
     return 1;
 }
 
+/*
+ * Return all blocks in a thread's caches to the shared freelists
+ * when that thread exits.
+ */
+static void thread_cache_destructor(void *arg) {
+    ThreadCacheState *state = arg;
+
+    if (state == NULL) {
+        return;
+    }
+
+    /*
+     * Clear the TLS pointer before releasing the state.
+     */
+    thread_cache_state = NULL;
+
+    for (size_t i = 0; i < CLASS_COUNT; ++i) {
+        ThreadCache *cache = &state->classes[i];
+
+        if (cache->free_list == NULL) {
+            continue;
+        }
+
+        SizeClass *class = &size_classes[i];
+
+        spin_lock(&class->lock);
+
+        BlockHeader *tail = cache->free_list;
+
+        while (tail->next != NULL) {
+            tail = tail->next;
+        }
+
+        tail->next = class->free_list;
+        class->free_list = cache->free_list;
+
+        spin_unlock(&class->lock);
+    }
+
+    munmap(state, sizeof(*state));
+}
+
+static void create_cache_key(void) {
+    cache_key_ready =
+        pthread_key_create(&cache_key, thread_cache_destructor) == 0;
+}
+
+/*
+ * Lazily create per-thread cache state.
+ */
+static ThreadCacheState *get_thread_cache_state(void) {
+    if (thread_cache_state != NULL) {
+        return thread_cache_state;
+    }
+
+    pthread_once(&cache_key_once, create_cache_key);
+
+    if (!cache_key_ready) {
+        return NULL;
+    }
+
+    void *memory = mmap(NULL, sizeof(ThreadCacheState),
+                        PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+    if (memory == MAP_FAILED) {
+        return NULL;
+    }
+
+    ThreadCacheState *state = memory;
+
+    if (pthread_setspecific(cache_key, state) != 0) {
+        munmap(state, sizeof(*state));
+        return NULL;
+    }
+
+    thread_cache_state = state;
+    return state;
+}
+
+/*
+ * Refill the calling thread's cache with up to CACHE_BATCH_SIZE blocks
+ * from the shared freelist.
+ */
+static int refill_thread_cache(size_t index) {
+    ThreadCacheState *state = get_thread_cache_state();
+
+    if (state == NULL) {
+        return 0;
+    }
+
+    ThreadCache *cache = &state->classes[index];
+    SizeClass *class = &size_classes[index];
+
+    spin_lock(&class->lock);
+
+    if (class->free_list == NULL && !refill_class(index)) {
+        spin_unlock(&class->lock);
+        return 0;
+    }
+
+    size_t moved = 0;
+
+    while (class->free_list != NULL && moved < CACHE_BATCH_SIZE) {
+        BlockHeader *header = class->free_list;
+        class->free_list = header->next;
+
+        header->next = cache->free_list;
+        cache->free_list = header;
+
+        ++cache->count;
+        ++moved;
+    }
+
+    spin_unlock(&class->lock);
+
+    return moved != 0;
+}
+
+/*
+ * Return CACHE_BATCH_SIZE blocks from the calling thread's cache
+ * to the shared freelist. The caller should have more than
+ * CACHE_MAX_BLOCKS cached blocks.
+ */
+static void flush_thread_cache(size_t index) {
+    ThreadCacheState *state = get_thread_cache_state();
+
+    if (state == NULL) {
+        return;
+    }
+
+    ThreadCache *cache = &state->classes[index];
+    SizeClass *class = &size_classes[index];
+
+    BlockHeader *batch = NULL;
+    size_t moved = 0;
+
+    while (cache->free_list != NULL && moved < CACHE_BATCH_SIZE) {
+        BlockHeader *header = cache->free_list;
+        cache->free_list = header->next;
+
+        header->next = batch;
+        batch = header;
+
+        --cache->count;
+        ++moved;
+    }
+
+    if (batch == NULL) {
+        return;
+    }
+
+    spin_lock(&class->lock);
+
+    BlockHeader *tail = batch;
+
+    while (tail->next != NULL) {
+        tail = tail->next;
+    }
+
+    tail->next = class->free_list;
+    class->free_list = batch;
+
+    spin_unlock(&class->lock);
+}
+
 static void *malloc_impl(size_t size) {
     if (size == 0 || size > SIZE_MAX - (ALIGNMENT - 1)) {
         return NULL;
@@ -185,7 +375,7 @@ static void *malloc_impl(size_t size) {
     size_t index = size_to_class(size);
 
     /*
-     * large blocks bypass the class freelists
+     * Large blocks bypass the size-class caches.
      */
     if (index == NO_CLASS ||
         class_capacity(index) >= DIRECT_MMAP_THRESHOLD) {
@@ -193,23 +383,49 @@ static void *malloc_impl(size_t size) {
         return header ? (void *)(header + 1) : NULL;
     }
 
-    SizeClass *class = &size_classes[index];
+    ThreadCacheState *state = get_thread_cache_state();
 
-    spin_lock(&class->lock);
+    if (state == NULL) {
+        /*
+         * If thread-cache setup fails, fall back to the shared freelist.
+         */
+        SizeClass *class = &size_classes[index];
 
-    if (class->free_list == NULL && !refill_class(index)) {
+        spin_lock(&class->lock);
+
+        if (class->free_list == NULL && !refill_class(index)) {
+            spin_unlock(&class->lock);
+            return NULL;
+        }
+
+        BlockHeader *header = class->free_list;
+        class->free_list = header->next;
+
+        header->next = NULL;
+        header->actual_size = size;
+        header->is_free = false;
+
         spin_unlock(&class->lock);
+
+        return (void *)(header + 1);
+    }
+
+    ThreadCache *cache = &state->classes[index];
+
+    /*
+     * Fast path: allocate from the local cache without a shared lock.
+     */
+    if (cache->free_list == NULL && !refill_thread_cache(index)) {
         return NULL;
     }
 
-    BlockHeader *header = class->free_list;
-    class->free_list = header->next;
+    BlockHeader *header = cache->free_list;
+    cache->free_list = header->next;
+    --cache->count;
 
     header->next = NULL;
     header->actual_size = size;
     header->is_free = false;
-
-    spin_unlock(&class->lock);
 
     return (void *)(header + 1);
 }
@@ -222,7 +438,7 @@ static void free_impl(void *ptr) {
     BlockHeader *header = (BlockHeader *)ptr - 1;
 
     /*
-     * dedicated mappings can be returned directly to the os
+     * Dedicated mappings can be returned directly to the OS.
      */
     if (header->class_index == NO_CLASS) {
         size_t mapping_size = header->mapping_size;
@@ -231,25 +447,53 @@ static void free_impl(void *ptr) {
     }
 
     size_t index = header->class_index;
-    SizeClass *class = &size_classes[index];
-
-    spin_lock(&class->lock);
 
     /*
-     * avoid inserting the same block twice if a block is accidentally
-     * freed twice. passing an invalid pointer to free remains undefined
+     * Double-free protection for ordinary sequential misuse.
+     * Concurrent or invalid frees remain undefined behavior.
      */
     if (header->is_free) {
+        return;
+    }
+
+    ensure_classes_initialized();
+
+    header->actual_size = 0;
+    header->is_free = true;
+
+    ThreadCacheState *state = get_thread_cache_state();
+
+    if (state == NULL) {
+        /*
+         * If cache setup fails, return the block directly to the
+         * shared freelist instead of losing it.
+         */
+        SizeClass *class = &size_classes[index];
+
+        spin_lock(&class->lock);
+
+        header->next = class->free_list;
+        class->free_list = header;
+
         spin_unlock(&class->lock);
         return;
     }
 
-    header->actual_size = 0;
-    header->is_free = true;
-    header->next = class->free_list;
-    class->free_list = header;
+    ThreadCache *cache = &state->classes[index];
 
-    spin_unlock(&class->lock);
+    /*
+     * Fast path: return the block to the freeing thread's local cache.
+     */
+    header->next = cache->free_list;
+    cache->free_list = header;
+    ++cache->count;
+
+    /*
+     * Keep local caches bounded by returning a batch to the shared list.
+     */
+    if (cache->count > CACHE_MAX_BLOCKS) {
+        flush_thread_cache(index);
+    }
 }
 
 static void *calloc_impl(size_t nmemb, size_t size) {
@@ -285,8 +529,7 @@ static void *realloc_impl(void *ptr, size_t size) {
     size_t old_size = old_header->actual_size;
 
     /*
-     * keep the allocation if its existing capacity is sufficient
-     * update the requested size for future realloc calls.
+     * Keep the allocation if its existing capacity is sufficient.
      */
     if (old_header->size >= size) {
         old_header->actual_size = size;
