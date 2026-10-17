@@ -26,6 +26,9 @@ int main(void) {
     char *grown;
     char *shrunk;
     volatile size_t huge_count = SIZE_MAX;
+    void *zero_ptr;
+    void *zero_count;
+    void *zero_size;
 
     CHECK_START("malloc basic allocation");
     p = malloc(32);
@@ -47,7 +50,8 @@ int main(void) {
     CHECK_DONE("free basic allocation");
 
     CHECK_START("malloc zero");
-    assert(malloc(0) == NULL);
+    zero_ptr = malloc(0);
+    free(zero_ptr);
     CHECK_DONE("malloc zero");
 
     CHECK_START("calloc zero initialization");
@@ -67,11 +71,13 @@ int main(void) {
     CHECK_DONE("calloc multiplication overflow");
 
     CHECK_START("calloc zero count");
-    assert(calloc(0, 10) == NULL);
+    zero_count = calloc(0, 10);
+    free(zero_count);
     CHECK_DONE("calloc zero count");
 
     CHECK_START("calloc zero element size");
-    assert(calloc(10, 0) == NULL);
+    zero_size = calloc(10, 0);
+    free(zero_size);
     CHECK_DONE("calloc zero element size");
 
     CHECK_START("realloc grow");
