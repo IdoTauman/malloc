@@ -17,7 +17,7 @@
 typedef struct {
     BlockHeader *free_list;
     spinlock_t lock;
-} SizeClass;
+} __attribute__((aligned(64))) SizeClass;
 
 static SizeClass size_classes[CLASS_COUNT];
 
