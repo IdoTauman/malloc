@@ -1,5 +1,7 @@
 CC       := gcc
-CFLAGS   := -std=c11 -Wall -Wextra -Werror -O2 -g -pthread -fno-builtin-malloc
+CFLAGS := -std=c11 -Wall -Wextra -Werror -O2 -g -pthread \
+          -fno-builtin-malloc -fno-builtin-calloc \
+          -fno-builtin-realloc -fno-builtin-free
 CPPFLAGS := -D_DEFAULT_SOURCE -Iinclude
 LDFLAGS  := -pthread
 
